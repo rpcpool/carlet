@@ -144,6 +144,39 @@ type CarPiecesAndMetadata struct {
 
 // SplitAndCommp splits a car file into smaller car files but also calculates commP at the same time.
 func SplitAndCommp(r io.Reader, targetSize int, namePrefix string) (*CarPiecesAndMetadata, error) {
+	return SplitAndCommpWithFileCreatorFunc(r, targetSize, namePrefix, func(fname string) (fileLike, error) {
+		return os.Create(fname)
+	})
+}
+
+// SplitAndCommpNoSavePieces splits a car file into smaller car files withouth saving them to disk.
+// This is useful for when you only want to calculate commP and save metadata.
+func SplitAndCommpNoSavePieces(r io.Reader, targetSize int, namePrefix string) (*CarPiecesAndMetadata, error) {
+	return SplitAndCommpWithFileCreatorFunc(r, targetSize, namePrefix, func(fname string) (fileLike, error) {
+		return devNullFile{}, nil
+	})
+}
+
+type devNullFile struct{}
+
+func (devNullFile) Write(p []byte) (n int, err error) {
+	return len(p), nil
+}
+
+func (devNullFile) Close() error {
+	return nil
+}
+
+func (devNullFile) Sync() error {
+	return nil
+}
+
+func SplitAndCommpWithFileCreatorFunc(
+	r io.Reader,
+	targetSize int,
+	namePrefix string,
+	fileCreatorFunc func(string) (fileLike, error),
+) (*CarPiecesAndMetadata, error) {
 	out := &CarPiecesAndMetadata{}
 
 	streamBuf := bufio.NewReaderSize(r, bufSize)
@@ -160,7 +193,7 @@ func SplitAndCommp(r io.Reader, targetSize int, namePrefix string) (*CarPiecesAn
 	var i int
 	for {
 		fname := fmt.Sprintf("%s%d.car", namePrefix, i)
-		pieceFile, err := os.Create(fname)
+		pieceFile, err := fileCreatorFunc(fname)
 		if err != nil {
 			return out, fmt.Errorf("failed to create file %q: %s", fname, err)
 		}
@@ -274,11 +307,17 @@ func resetCP(cp *commp.Calc) error {
 	return err
 }
 
+type fileLike interface {
+	io.Writer
+	io.Closer
+	Sync() error
+}
+
 func cleanup(
 	cp *commp.Calc,
 	namePrefix string,
 	index int,
-	pieceFile *os.File,
+	pieceFile fileLike,
 	fBuf *bufio.Writer,
 ) (CarFile, error) {
 	rawCommP, paddedSize, err := cp.Digest()
@@ -303,9 +342,13 @@ func cleanup(
 
 	oldn := fmt.Sprintf("%s%d.car", namePrefix, index)
 	newn := fmt.Sprintf("%s%s.car", namePrefix, commCid)
-	err = os.Rename(oldn, newn)
-	if err != nil {
-		return CarFile{}, err
+
+	// if isn't devNullFile, then it's a real file, so we need to rename it
+	if _, ok := pieceFile.(devNullFile); ok {
+		err = os.Rename(oldn, newn)
+		if err != nil {
+			return CarFile{}, err
+		}
 	}
 
 	return CarFile{
