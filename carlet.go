@@ -2,6 +2,8 @@ package carlet
 
 import (
 	"bufio"
+	"bytes"
+	"encoding/base64"
 	"encoding/binary"
 	"fmt"
 	"io"
@@ -36,37 +38,38 @@ const (
 )
 
 type CarFile struct {
-	Name       string
-	CommP      cid.Cid
-	PaddedSize uint64
+	Name        string  `json:"name" yaml:"name"`
+	CommP       cid.Cid `json:"commP" yaml:"commP"`
+	PaddedSize  uint64  `json:"paddedSize" yaml:"paddedSize"`
+	HeaderSize  uint64  `json:"headerSize" yaml:"headerSize"`   // Header size prefix + actual header size (nulRootCarHeader)
+	ContentSize uint64  `json:"contentSize" yaml:"contentSize"` // Actual content size, not including header and padding.
 }
 
 // SplitCar splits a car file into smaller car files of the specified target size
 func SplitCar(rdr io.Reader, targetSize int, namePrefix string) error {
-
 	streamBuf := bufio.NewReaderSize(rdr, bufSize)
 	var streamLen int64
 
 	maybeHeaderLen, err := streamBuf.Peek(varintSize)
 	if err != nil {
-		return fmt.Errorf("failed to read header: %s\n", err)
+		return fmt.Errorf("failed to read header: %s", err)
 	}
 
 	hdrLen, viLen := binary.Uvarint(maybeHeaderLen)
 	if hdrLen <= 0 || viLen < 0 {
-		return fmt.Errorf("unexpected header len = %d, varint len = %d\n", hdrLen, viLen)
+		return fmt.Errorf("unexpected header len = %d, varint len = %d", hdrLen, viLen)
 	}
 
 	actualViLen, err := io.CopyN(io.Discard, streamBuf, int64(viLen))
 	if err != nil {
-		return fmt.Errorf("failed to discard header varint: %s\n", err)
+		return fmt.Errorf("failed to discard header varint: %s", err)
 	}
 	streamLen += actualViLen
 
 	// ignoring header decoding for now
 	actualHdrLen, err := io.CopyN(io.Discard, streamBuf, int64(hdrLen))
 	if err != nil {
-		return fmt.Errorf("failed to discard header header: %s\n", err)
+		return fmt.Errorf("failed to discard header header: %s", err)
 	}
 	streamLen += actualHdrLen
 
@@ -76,10 +79,10 @@ func SplitCar(rdr io.Reader, targetSize int, namePrefix string) error {
 		fmt.Printf("Writing file: %s\n", f)
 		fi, err := os.Create(f)
 		if err != nil {
-			return fmt.Errorf("failed to create file: %s\n", err)
+			return fmt.Errorf("failed to create file: %s", err)
 		}
 		if _, err := io.WriteString(fi, nulRootCarHeader); err != nil {
-			return fmt.Errorf("failed to write empty header: %s\n", err)
+			return fmt.Errorf("failed to write empty header: %s", err)
 		}
 
 		var carletLen int64
@@ -89,10 +92,10 @@ func SplitCar(rdr io.Reader, targetSize int, namePrefix string) error {
 				return nil
 			}
 			if err != nil && err != bufio.ErrBufferFull {
-				return fmt.Errorf("unexpected error at offset %d: %s\n", streamLen, err)
+				return fmt.Errorf("unexpected error at offset %d: %s", streamLen, err)
 			}
 			if len(maybeNextFrameLen) == 0 {
-				return fmt.Errorf("impossible 0-length peek without io.EOF at offset %d\n", streamLen)
+				return fmt.Errorf("impossible 0-length peek without io.EOF at offset %d", streamLen)
 			}
 
 			frameLen, viL := binary.Uvarint(maybeNextFrameLen)
@@ -121,128 +124,163 @@ func SplitCar(rdr io.Reader, targetSize int, namePrefix string) error {
 	}
 }
 
+const (
+	_KiB = 1024
+	_MiB = _KiB * 1024
+)
+
+func alignToPageSize(size int) int {
+	alignment := int(os.Getpagesize())
+	mask := alignment - 1
+	mem := uintptr(size + alignment)
+	return int((mem + uintptr(mask)) & ^uintptr(mask))
+}
+
+type CarPiecesAndMetadata struct {
+	OriginalCarHeaderSize uint64    `json:"originalCarHeaderSize" yaml:"originalCarHeaderSize"` // Size of the original car header, including the size prefix.
+	OriginalCarHeader     string    `json:"originalCarHeader" yaml:"originalCarHeader"`         // Base64-encoded original car header (without the size prefix).
+	CarPieces             []CarFile `json:"carPieces" yaml:"carPieces"`                         // List of car file pieces.
+}
+
 // SplitAndCommp splits a car file into smaller car files but also calculates commP at the same time.
-func SplitAndCommp(r io.Reader, targetSize int, namePrefix string) ([]CarFile, error) {
-	var carFiles []CarFile
+func SplitAndCommp(r io.Reader, targetSize int, namePrefix string) (*CarPiecesAndMetadata, error) {
+	out := &CarPiecesAndMetadata{}
 
 	streamBuf := bufio.NewReaderSize(r, bufSize)
 	var streamLen int64
 
-	streamLen, err := discardHeader(streamBuf, streamLen)
+	actualHeader, streamLen, err := readHeader(streamBuf, streamLen)
 	if err != nil {
-		return carFiles, err
+		return out, err
 	}
+	originalHeaderSize := streamLen
+	out.OriginalCarHeaderSize = uint64(originalHeaderSize)
+	out.OriginalCarHeader = base64.StdEncoding.EncodeToString(actualHeader)
 
 	var i int
 	for {
 		fname := fmt.Sprintf("%s%d.car", namePrefix, i)
-		fi, err := os.Create(fname)
+		pieceFile, err := os.Create(fname)
+		if err != nil {
+			return out, fmt.Errorf("failed to create file %q: %s", fname, err)
+		}
+		fiWriteBuffer := bufio.NewWriterSize(pieceFile, alignToPageSize(_MiB*12))
 		cp := new(commp.Calc)
 
-		w := io.MultiWriter(fi, cp)
+		wr := io.MultiWriter(fiWriteBuffer, cp)
 
-		if err != nil {
-			return carFiles, fmt.Errorf("failed to create file: %s\n", err)
-		}
-		if _, err := io.WriteString(w, nulRootCarHeader); err != nil {
-			return carFiles, fmt.Errorf("failed to write empty header: %s\n", err)
+		if _, err := io.WriteString(wr, nulRootCarHeader); err != nil {
+			return out, fmt.Errorf("failed to write empty header: %s", err)
 		}
 
 		var carletLen int64
 		for carletLen < int64(targetSize) {
 			maybeNextFrameLen, err := streamBuf.Peek(varintSize)
 			if err == io.EOF {
-				carFile, err := cleanup(cp, namePrefix, i, fi)
+				carFile, err := cleanup(cp, namePrefix, i, pieceFile, fiWriteBuffer)
+				carFile.HeaderSize = uint64(len(nulRootCarHeader))
+				carFile.ContentSize = uint64(carletLen)
 				if err != nil {
-					return carFiles, err
+					return out, err
 				}
-				carFiles = append(carFiles, carFile)
+				out.CarPieces = append(out.CarPieces, carFile)
 
-				return carFiles, nil
+				return out, nil
 			}
 			if err != nil && err != bufio.ErrBufferFull {
-				return carFiles, fmt.Errorf("unexpected error at offset %d: %s\n", streamLen, err)
+				return out, fmt.Errorf("unexpected error at offset %d: %s", streamLen, err)
 			}
 			if len(maybeNextFrameLen) == 0 {
-				return carFiles, fmt.Errorf("impossible 0-length peek without io.EOF at offset %d\n", streamLen)
+				return out, fmt.Errorf("impossible 0-length peek without io.EOF at offset %d", streamLen)
 			}
 
 			frameLen, viL := binary.Uvarint(maybeNextFrameLen)
 			if viL <= 0 {
 				// car file with trailing garbage behind it
-				return carFiles, fmt.Errorf("aborting car stream parse: undecodeable varint at offset %d", streamLen)
+				return out, fmt.Errorf("aborting car stream parse: undecodeable varint at offset %d", streamLen)
 			}
 			if frameLen > maxBlockSize {
 				// anything over ~2MiB got to be a mistake
-				return carFiles, fmt.Errorf("aborting car stream parse: unexpectedly large frame length of %d bytes at offset %d", frameLen, streamLen)
+				return out, fmt.Errorf("aborting car stream parse: unexpectedly large frame length of %d bytes at offset %d", frameLen, streamLen)
 			}
 
-			actualFrameLen, err := io.CopyN(w, streamBuf, int64(viL)+int64(frameLen))
+			actualFrameLen, err := io.CopyN(wr, streamBuf, int64(viL)+int64(frameLen))
 			streamLen += actualFrameLen
 			carletLen += actualFrameLen
 			if err != nil {
 				if err != io.EOF {
-					return carFiles, fmt.Errorf("unexpected error at offset %d: %s", streamLen-actualFrameLen, err)
+					return out, fmt.Errorf("unexpected error at offset %d: %s", streamLen-actualFrameLen, err)
 				}
-				carFile, err := cleanup(cp, namePrefix, i, fi)
+				carFile, err := cleanup(cp, namePrefix, i, pieceFile, fiWriteBuffer)
+				carFile.HeaderSize = uint64(len(nulRootCarHeader))
+				carFile.ContentSize = uint64(carletLen)
 				if err != nil {
-					return carFiles, err
+					return out, err
 				}
-				carFiles = append(carFiles, carFile)
+				out.CarPieces = append(out.CarPieces, carFile)
 
-				return carFiles, nil
+				return out, nil
 			}
 		}
 
-		carFile, err := cleanup(cp, namePrefix, i, fi)
+		carFile, err := cleanup(cp, namePrefix, i, pieceFile, fiWriteBuffer)
+		carFile.HeaderSize = uint64(len(nulRootCarHeader))
+		carFile.ContentSize = uint64(carletLen)
 		if err != nil {
-			return carFiles, err
+			return out, err
 		}
-		carFiles = append(carFiles, carFile)
+		out.CarPieces = append(out.CarPieces, carFile)
 
 		err = resetCP(cp)
 		if err != nil {
-			return carFiles, err
+			return out, err
 		}
 		i++
 	}
 }
 
-func discardHeader(streamBuf *bufio.Reader, streamLen int64) (int64, error) {
+func readHeader(streamBuf *bufio.Reader, streamLen int64) ([]byte, int64, error) {
 	maybeHeaderLen, err := streamBuf.Peek(varintSize)
 	if err != nil {
-		return 0, fmt.Errorf("failed to read header: %s\n", err)
+		return nil, 0, fmt.Errorf("failed to read header: %s", err)
 	}
 
 	hdrLen, viLen := binary.Uvarint(maybeHeaderLen)
 	if hdrLen <= 0 || viLen < 0 {
-		return 0, fmt.Errorf("unexpected header len = %d, varint len = %d\n", hdrLen, viLen)
+		return nil, 0, fmt.Errorf("unexpected header len = %d, varint len = %d", hdrLen, viLen)
 	}
 
 	actualViLen, err := io.CopyN(io.Discard, streamBuf, int64(viLen))
 	if err != nil {
-		return 0, fmt.Errorf("failed to discard header varint: %s\n", err)
+		return nil, 0, fmt.Errorf("failed to discard header varint: %s", err)
 	}
 	streamLen += actualViLen
 
+	headerBuf := new(bytes.Buffer)
+
 	// ignoring header decoding for now
-	actualHdrLen, err := io.CopyN(io.Discard, streamBuf, int64(hdrLen))
+	actualHdrLen, err := io.CopyN(headerBuf, streamBuf, int64(hdrLen))
 	if err != nil {
-		return 0, fmt.Errorf("failed to discard header header: %s\n", err)
+		return nil, 0, fmt.Errorf("failed to discard header header: %s", err)
 	}
 	streamLen += actualHdrLen
 
-	return streamLen, nil
+	return headerBuf.Bytes(), streamLen, nil
 }
 
 func resetCP(cp *commp.Calc) error {
 	cp.Reset()
 	_, err := cp.Write([]byte(nulRootCarHeader))
-
 	return err
 }
 
-func cleanup(cp *commp.Calc, namePrefix string, i int, f *os.File) (CarFile, error) {
+func cleanup(
+	cp *commp.Calc,
+	namePrefix string,
+	index int,
+	pieceFile *os.File,
+	fBuf *bufio.Writer,
+) (CarFile, error) {
 	rawCommP, paddedSize, err := cp.Digest()
 	if err != nil {
 		return CarFile{}, err
@@ -253,8 +291,17 @@ func cleanup(cp *commp.Calc, namePrefix string, i int, f *os.File) (CarFile, err
 		return CarFile{}, err
 	}
 
-	f.Close()
-	oldn := fmt.Sprintf("%s%d.car", namePrefix, i)
+	err = fBuf.Flush()
+	if err != nil {
+		return CarFile{}, err
+	}
+	err = pieceFile.Sync()
+	if err != nil {
+		return CarFile{}, err
+	}
+	pieceFile.Close()
+
+	oldn := fmt.Sprintf("%s%d.car", namePrefix, index)
 	newn := fmt.Sprintf("%s%s.car", namePrefix, commCid)
 	err = os.Rename(oldn, newn)
 	if err != nil {
