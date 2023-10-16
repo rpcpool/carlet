@@ -344,7 +344,7 @@ func cleanup(
 	newn := fmt.Sprintf("%s%s.car", namePrefix, commCid)
 
 	// if isn't devNullFile, then it's a real file, so we need to rename it
-	if _, ok := pieceFile.(devNullFile); ok {
+	if _, ok := pieceFile.(devNullFile); !ok {
 		err = os.Rename(oldn, newn)
 		if err != nil {
 			return CarFile{}, err
