@@ -151,7 +151,7 @@ func SplitAndCommp(r io.Reader, targetSize int, namePrefix string) (*CarPiecesAn
 
 // SplitAndCommpNoSavePieces splits a car file into smaller car files withouth saving them to disk.
 // This is useful for when you only want to calculate commP and save metadata.
-func SplitAndCommpNoSavePieces(r io.Reader, targetSize int, namePrefix string) (*CarPiecesAndMetadata, error) {
+func SplitAndCommpDryRun(r io.Reader, targetSize int, namePrefix string) (*CarPiecesAndMetadata, error) {
 	return SplitAndCommpWithFileCreatorFunc(r, targetSize, namePrefix, func(fname string) (fileLike, error) {
 		return devNullFile{}, nil
 	})
